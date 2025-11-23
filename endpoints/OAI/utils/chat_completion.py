@@ -1,6 +1,7 @@
 """Chat completion utilities for OAI server."""
 
 import asyncio
+import json
 import pathlib
 from asyncio import CancelledError
 from typing import List, Optional
@@ -29,7 +30,11 @@ from endpoints.OAI.types.chat_completion import (
 )
 from endpoints.OAI.types.common import UsageStats
 from endpoints.OAI.utils.completion import _parse_gen_request_id, _stream_collector
-from endpoints.OAI.utils.tools import ToolCallProcessor, TOOL_CALL_SCHEMA
+from endpoints.OAI.utils.tools import (
+    ToolCallProcessor,
+    TOOL_CALL_SCHEMA,
+    TOOL_CALL_SCHEMA_QWEN,
+)
 
 
 def _create_response(
@@ -39,13 +44,34 @@ def _create_response(
 
     choices = []
     for index, generation in enumerate(generations):
-        message = ChatCompletionMessage(
-            role="assistant", content=unwrap(generation.get("text"), "")
-        )
+        content = unwrap(generation.get("text"), "")
+        message = ChatCompletionMessage(role="assistant", content=content)
 
-        tool_calls = generation["tool_calls"]
-        if tool_calls:
-            message.tool_calls = ToolCallProcessor.from_json(tool_calls)
+        # Check for tool calls in generation metadata
+        tool_calls = generation.get("tool_calls")
+
+        # If no tool_calls in metadata, try to extract from content
+        if not tool_calls and content:
+            import re
+            # Check if content contains <tool_call> tags
+            if '<tool_call>' in content:
+                tool_calls = content
+                # Remove tool call from visible content
+                message.content = re.sub(
+                    r'<tool_call>.*?</tool_call>', '', content, flags=re.DOTALL
+                ).strip()
+
+        if tool_calls and tool_calls.strip():
+            # Auto-detect format: XML if starts with <, otherwise JSON
+            try:
+                logger.debug(f"Parsing tool calls (length={len(tool_calls)}): {tool_calls[:200]}")
+                if tool_calls.strip().startswith('<'):
+                    message.tool_calls = ToolCallProcessor.from_xml(tool_calls)
+                else:
+                    message.tool_calls = ToolCallProcessor.from_json(tool_calls)
+                logger.debug(f"Successfully parsed {len(message.tool_calls)} tool calls")
+            except Exception as e:
+                logger.warning(f"Failed to parse tool calls: {e}, content: {tool_calls[:200]}")
 
         logprob_response = None
 
@@ -144,16 +170,31 @@ def _create_stream_chunk(
         # Mark finish_reason as tool_calls since this is the last chunk
         if "tool_calls" in generation:
             tool_calls = generation["tool_calls"]
-            message = ChatCompletionMessage(
-                tool_calls=ToolCallProcessor.from_json(tool_calls)
-            )
-            choice.delta = message
-            choice.finish_reason = "tool_calls"
+            if tool_calls and tool_calls.strip():
+                # Auto-detect format: XML if starts with <, otherwise JSON
+                try:
+                    if tool_calls.strip().startswith('<'):
+                        parsed_tool_calls = ToolCallProcessor.from_xml(tool_calls)
+                    else:
+                        parsed_tool_calls = ToolCallProcessor.from_json(tool_calls)
+
+                    message = ChatCompletionMessage(tool_calls=parsed_tool_calls)
+                    choice.delta = message
+                    choice.finish_reason = "tool_calls"
+                except Exception as e:
+                    logger.warning(f"Failed to parse tool calls: {e}")
 
         choices.append(choice)
     else:
+        text_content = unwrap(generation.get("text"), "")
+
+        # Remove any tool call fragments that might leak through
+        import re
+        if '</tool_call>' in text_content and '<tool_call>' not in text_content:
+            text_content = text_content.replace('</tool_call>', '').strip()
+
         message = ChatCompletionMessage(
-            role="assistant", content=unwrap(generation.get("text"), "")
+            role="assistant", content=text_content
         )
 
         logprob_response = None
@@ -235,7 +276,22 @@ async def format_messages_with_template(
             # Convert the message content into a concatenated string
             message.content = concatenated_content
 
-        message_dicts.append(message.model_dump(exclude_none=True))
+        message_dict = message.model_dump(exclude_none=True)
+
+        # Convert tool_calls arguments from JSON string to dict for template compatibility
+        if "tool_calls" in message_dict and message_dict["tool_calls"]:
+            for tool_call in message_dict["tool_calls"]:
+                if "function" in tool_call and "arguments" in tool_call["function"]:
+                    arguments = tool_call["function"]["arguments"]
+                    # If arguments is a JSON string, parse it to dict
+                    if isinstance(arguments, str):
+                        try:
+                            tool_call["function"]["arguments"] = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            # Keep as string if parsing fails
+                            pass
+
+        message_dicts.append(message_dict)
 
     # Get all special tokens
     special_tokens_dict = model.container.get_special_tokens()
@@ -344,6 +400,7 @@ async def stream_generate_chat_completion(
 
         # Text accumulation for tool calls
         current_generation_text = ""
+        tool_call_started = False
 
         # Consumer loop
         while True:
@@ -367,18 +424,58 @@ async def stream_generate_chat_completion(
                     generation = generations[0]
                 elif "text" in generation:
                     current_generation_text += generation["text"]
+            else:
+                # Accumulate text even without tool_start
+                if "text" in generation:
+                    current_generation_text += generation["text"]
 
             # Stream collector will push an exception to the queue if it fails
             if isinstance(generation, Exception):
                 raise generation
 
-            response = _create_stream_chunk(
-                request.state.id, generation, model_path.name
-            )
-            yield response.model_dump_json()
+            # Check if we're inside a tool call block and should suppress output
+            if '<tool_call>' in current_generation_text:
+                if '</tool_call>' not in current_generation_text:
+                    tool_call_started = True
+                else:
+                    tool_call_started = False
+
+            # Don't stream text chunks that are part of tool calls
+            # But do stream non-text chunks (like finish_reason)
+            should_stream = True
+            if tool_call_started and "text" in generation:
+                should_stream = False
+            elif "finish_reason" in generation and not "text" in generation:
+                should_stream = True
+
+            if should_stream:
+                response = _create_stream_chunk(
+                    request.state.id, generation, model_path.name
+                )
+                yield response.model_dump_json()
 
             # Check if all tasks are completed
             if all(task.done() for task in gen_tasks) and gen_queue.empty():
+                # Check for tool calls in accumulated text
+                if current_generation_text and '<tool_call>' in current_generation_text:
+                    import re
+                    # Extract tool calls from the accumulated text
+                    tool_call_match = re.search(r'<tool_call>.*?</tool_call>', current_generation_text, re.DOTALL)
+                    if tool_call_match:
+                        logger.info(f"Extracted tool call from stream: {tool_call_match.group(0)[:100]}")
+                        generation["tool_calls"] = tool_call_match.group(0)
+                        generation["finish_reason"] = "tool_calls"
+
+                        # Remove the tool call from the full text to get clean content
+                        clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', current_generation_text, flags=re.DOTALL).strip()
+                        generation["text"] = clean_text
+
+                        # Send final chunk with tool calls
+                        final_chunk = _create_stream_chunk(
+                            request.state.id, generation, model_path.name
+                        )
+                        yield final_chunk.model_dump_json()
+
                 # Send a usage chunk
                 if data.stream_options and data.stream_options.include_usage:
                     usage_chunk = _create_stream_chunk(
@@ -473,7 +570,14 @@ async def generate_tool_calls(
 
     # Copy to make sure the parent JSON schema doesn't get modified
     tool_data = data.model_copy(deep=True)
-    tool_data.json_schema = TOOL_CALL_SCHEMA
+
+    # Use Qwen schema if tool_start is <tool_call>, otherwise use standard schema
+    if tool_start == "<tool_call>":
+        tool_data.json_schema = TOOL_CALL_SCHEMA_QWEN
+        logger.info(f"Using Qwen tool call schema: {TOOL_CALL_SCHEMA_QWEN}")
+    else:
+        tool_data.json_schema = TOOL_CALL_SCHEMA
+        logger.info(f"Using standard tool call schema")
 
     for idx, gen in enumerate(generations):
         if gen["stop_str"] != tool_start:
@@ -485,6 +589,7 @@ async def generate_tool_calls(
         precursor_text = gen.get("full_text")
         if precursor_text:
             prompt = prompt + precursor_text
+            logger.debug(f"Tool call precursor text: {precursor_text}")
 
         gen_request_id = gen.get("request_id")
         tool_request_id = f"{gen_request_id}-tool"
@@ -507,6 +612,8 @@ async def generate_tool_calls(
 
         # Map tool calls to their appropriate generation
         for gen_idx, tool_call in zip(tool_idx, tool_calls, strict=True):
-            generations[gen_idx]["tool_calls"] = tool_call["text"]
+            tool_call_text = tool_call["text"]
+            logger.info(f"Generated tool call JSON: {tool_call_text}")
+            generations[gen_idx]["tool_calls"] = tool_call_text
 
     return generations
