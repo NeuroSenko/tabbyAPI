@@ -123,7 +123,7 @@ async def chat_completion_request(
 
     model_path = model.container.model_dir
 
-    prompt, embeddings = await apply_chat_template(data)
+    prompt, embeddings, generation_prefix = await apply_chat_template(data)
 
     # Set an empty JSON schema if the request wants a JSON response
     if data.response_format.type == "json":
@@ -134,13 +134,15 @@ async def chat_completion_request(
     if data.stream and not disable_request_streaming:
         return EventSourceResponse(
             stream_generate_chat_completion(
-                prompt, embeddings, data, request, model_path
+                prompt, embeddings, data, request, model_path, generation_prefix
             ),
             ping=maxsize,
         )
     else:
         generate_task = asyncio.create_task(
-            generate_chat_completion(prompt, embeddings, data, request, model_path)
+            generate_chat_completion(
+                prompt, embeddings, data, request, model_path, generation_prefix
+            )
         )
 
         response = await run_with_request_disconnect(

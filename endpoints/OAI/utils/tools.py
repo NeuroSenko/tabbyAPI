@@ -79,10 +79,11 @@ class ToolCallProcessor:
     def from_xml(tool_calls_str: str) -> List[ToolCall]:
         """Parse tool calls from XML format to ToolCall objects
 
-        Supports three XML formats:
-        1. <invoke name="tool"><parameter name="arg">value</parameter></invoke>
-        2. <tool_call>{"name": "tool", "arguments": {...}}</tool_call>
-        3. <tool_call><function=tool><parameter=arg>value</parameter></function></tool_call>
+        Supports four XML formats:
+        1. <tool_call>{"name": "tool", "arguments": {...}}</tool_call>
+        2. <tool_call><function=tool><parameter=arg>value</parameter></function></tool_call>
+        3. <tool_call>tool_name<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>
+        4. <invoke name="tool"><parameter name="arg">value</parameter></invoke>
         """
 
         tool_calls = []
@@ -141,37 +142,66 @@ class ToolCallProcessor:
 
                     tool_calls.append(ToolCall(**tool_call_dict))
             else:
-                # Try the <invoke> format with <parameter> tags
-                invoke_pattern = r'<invoke name="([^"]+)">(.*?)</invoke>'
-                param_pattern = r'<parameter name="([^"]+)">(.*?)</parameter>'
+                # Try GLM-style format: <tool_call>func_name<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>
+                glm_tool_call_pattern = r'<tool_call>([^<]+)((?:<arg_key>.*?</arg_key>\s*<arg_value>.*?</arg_value>)*)\s*</tool_call>'
+                glm_arg_pattern = r'<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>'
 
-                invocations = re.findall(invoke_pattern, tool_calls_str, re.DOTALL)
+                glm_matches = re.findall(glm_tool_call_pattern, tool_calls_str, re.DOTALL)
 
-                for tool_name, invoke_body in invocations:
-                    # Extract all parameters from the invoke body
-                    parameters = {}
-                    params = re.findall(param_pattern, invoke_body, re.DOTALL)
+                if glm_matches:
+                    for tool_name, args_block in glm_matches:
+                        parameters = {}
+                        params = re.findall(glm_arg_pattern, args_block, re.DOTALL)
 
-                    for param_name, param_value in params:
-                        # Try to parse JSON values
-                        param_value = param_value.strip()
-                        try:
-                            # Try parsing as JSON (for arrays, objects, booleans, numbers)
-                            parsed_value = json.loads(param_value)
-                            parameters[param_name] = parsed_value
-                        except json.JSONDecodeError:
-                            # Keep as string if not valid JSON
-                            parameters[param_name] = param_value
+                        for param_name, param_value in params:
+                            param_name = param_name.strip()
+                            param_value = param_value.strip()
+                            try:
+                                parsed_value = json.loads(param_value)
+                                parameters[param_name] = parsed_value
+                            except json.JSONDecodeError:
+                                parameters[param_name] = param_value
 
-                    # Convert to the expected format
-                    tool_call_dict = {
-                        "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(parameters),
+                        tool_call_dict = {
+                            "function": {
+                                "name": tool_name.strip(),
+                                "arguments": json.dumps(parameters),
+                            }
                         }
-                    }
 
-                    tool_calls.append(ToolCall(**tool_call_dict))
+                        tool_calls.append(ToolCall(**tool_call_dict))
+                else:
+                    # Try the <invoke> format with <parameter> tags
+                    invoke_pattern = r'<invoke name="([^"]+)">(.*?)</invoke>'
+                    param_pattern = r'<parameter name="([^"]+)">(.*?)</parameter>'
+
+                    invocations = re.findall(invoke_pattern, tool_calls_str, re.DOTALL)
+
+                    for tool_name, invoke_body in invocations:
+                        # Extract all parameters from the invoke body
+                        parameters = {}
+                        params = re.findall(param_pattern, invoke_body, re.DOTALL)
+
+                        for param_name, param_value in params:
+                            # Try to parse JSON values
+                            param_value = param_value.strip()
+                            try:
+                                # Try parsing as JSON (for arrays, objects, booleans, numbers)
+                                parsed_value = json.loads(param_value)
+                                parameters[param_name] = parsed_value
+                            except json.JSONDecodeError:
+                                # Keep as string if not valid JSON
+                                parameters[param_name] = param_value
+
+                        # Convert to the expected format
+                        tool_call_dict = {
+                            "function": {
+                                "name": tool_name,
+                                "arguments": json.dumps(parameters),
+                            }
+                        }
+
+                        tool_calls.append(ToolCall(**tool_call_dict))
 
         return tool_calls
 

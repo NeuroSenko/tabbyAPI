@@ -37,15 +37,45 @@ from endpoints.OAI.utils.tools import (
 )
 
 
+def _chunk_to_reasoning(response):
+    """Convert content to reasoning_content in a stream chunk."""
+    for choice in response.choices:
+        delta = choice.delta
+        if isinstance(delta, ChatCompletionMessage) and delta.content:
+            delta.reasoning_content = delta.content
+            delta.content = None
+
+
+def _split_thinking(text: str) -> tuple:
+    """Split text containing <think>...</think> into reasoning and content.
+
+    Returns (reasoning_content, visible_content).
+    If no thinking block is found, returns (None, original_text).
+    """
+    if text.startswith("<think>") and "</think>" in text:
+        # Extract reasoning between <think> and </think>
+        think_end = text.index("</think>")
+        reasoning = text[len("<think>"):think_end]
+        content = text[think_end + len("</think>"):]
+        return reasoning.strip() or None, content.lstrip("\n")
+    return None, text
+
+
 def _create_response(
-    request_id: str, generations: List[dict], model_name: Optional[str]
+    request_id: str,
+    generations: List[dict],
+    model_name: Optional[str],
+    generation_prefix: str = "",
 ):
     """Create a chat completion response from the provided text."""
 
     choices = []
     for index, generation in enumerate(generations):
-        content = unwrap(generation.get("text"), "")
-        message = ChatCompletionMessage(role="assistant", content=content)
+        raw_text = generation_prefix + unwrap(generation.get("text"), "")
+        reasoning_content, content = _split_thinking(raw_text)
+        message = ChatCompletionMessage(
+            role="assistant", content=content, reasoning_content=reasoning_content
+        )
 
         # Check for tool calls in generation metadata
         tool_calls = generation.get("tool_calls")
@@ -334,6 +364,14 @@ async def apply_chat_template(data: ChatCompletionRequest):
                     "add_generation_prompt is False"
                 )
 
+        # Detect generation prefix for thinking models.
+        # When the template ends with <think>, it becomes part of the prompt
+        # but not the generated output. We capture it here so it can be
+        # prepended to the response, giving clients the full <think>...</think>.
+        generation_prefix = ""
+        if data.add_generation_prompt and prompt.endswith("<think>"):
+            generation_prefix = "<think>"
+
         # Removes the starting BOS token if the model adds one
         # This is to prevent add_bos_token from adding multiple bos tokens
         bos_token = template_vars.get("bos_token")
@@ -347,7 +385,7 @@ async def apply_chat_template(data: ChatCompletionRequest):
         # Add template metadata
         await _append_template_metadata(data, template_vars)
 
-        return prompt, mm_embeddings
+        return prompt, mm_embeddings, generation_prefix
 
     except KeyError as exc:
         error_message = handle_request_error(
@@ -369,6 +407,7 @@ async def stream_generate_chat_completion(
     data: ChatCompletionRequest,
     request: Request,
     model_path: pathlib.Path,
+    generation_prefix: str = "",
 ):
     """Generator for the generation process."""
     abort_event = asyncio.Event()
@@ -397,6 +436,13 @@ async def stream_generate_chat_completion(
             )
 
             gen_tasks.append(gen_task)
+
+        # Thinking mode: when generation_prefix is <think>, stream
+        # reasoning_content until </think>, then switch to content.
+        thinking_mode = bool(generation_prefix)
+        think_buffer = ""
+        THINK_END = "</think>"
+        THINK_END_LEN = len(THINK_END)
 
         # Text accumulation for tool calls
         current_generation_text = ""
@@ -449,10 +495,74 @@ async def stream_generate_chat_completion(
                 should_stream = True
 
             if should_stream:
-                response = _create_stream_chunk(
-                    request.state.id, generation, model_path.name
-                )
-                yield response.model_dump_json()
+                # Handle thinking mode: route to reasoning_content vs content
+                if thinking_mode and "text" in generation:
+                    think_buffer += generation.get("text", "")
+                    gen_index = generation.get("index", 0)
+
+                    if THINK_END in think_buffer:
+                        # Found </think> — split and switch modes
+                        split_idx = think_buffer.index(THINK_END)
+                        reasoning_part = think_buffer[:split_idx]
+                        content_part = think_buffer[
+                            split_idx + THINK_END_LEN :
+                        ]
+                        thinking_mode = False
+                        think_buffer = ""
+
+                        # Yield remaining reasoning content
+                        if reasoning_part:
+                            resp = _create_stream_chunk(
+                                request.state.id,
+                                {"text": reasoning_part, "index": gen_index},
+                                model_path.name,
+                            )
+                            _chunk_to_reasoning(resp)
+                            yield resp.model_dump_json()
+
+                        # Yield content after </think>
+                        if content_part:
+                            resp = _create_stream_chunk(
+                                request.state.id,
+                                {"text": content_part, "index": gen_index},
+                                model_path.name,
+                            )
+                            yield resp.model_dump_json()
+                    else:
+                        # Buffer last chars to handle </think> spanning chunks
+                        if len(think_buffer) > THINK_END_LEN - 1:
+                            safe = think_buffer[: -(THINK_END_LEN - 1)]
+                            think_buffer = think_buffer[
+                                -(THINK_END_LEN - 1) :
+                            ]
+
+                            resp = _create_stream_chunk(
+                                request.state.id,
+                                {"text": safe, "index": gen_index},
+                                model_path.name,
+                            )
+                            _chunk_to_reasoning(resp)
+                            yield resp.model_dump_json()
+                else:
+                    # Flush any remaining think_buffer as reasoning
+                    # (model ended without </think>)
+                    if think_buffer:
+                        resp = _create_stream_chunk(
+                            request.state.id,
+                            {
+                                "text": think_buffer,
+                                "index": generation.get("index", 0),
+                            },
+                            model_path.name,
+                        )
+                        _chunk_to_reasoning(resp)
+                        yield resp.model_dump_json()
+                        think_buffer = ""
+
+                    response = _create_stream_chunk(
+                        request.state.id, generation, model_path.name
+                    )
+                    yield response.model_dump_json()
 
             # Check if all tasks are completed
             if all(task.done() for task in gen_tasks) and gen_queue.empty():
@@ -510,6 +620,7 @@ async def generate_chat_completion(
     data: ChatCompletionRequest,
     request: Request,
     model_path: pathlib.Path,
+    generation_prefix: str = "",
 ):
     gen_tasks: List[asyncio.Task] = []
     tool_start = model.container.prompt_template.metadata.tool_start
@@ -539,7 +650,9 @@ async def generate_chat_completion(
                 prompt, embeddings, data, generations, request
             )
 
-        response = _create_response(request.state.id, generations, model_path.name)
+        response = _create_response(
+            request.state.id, generations, model_path.name, generation_prefix
+        )
 
         logger.info(f"Finished chat completion request {request.state.id}")
 

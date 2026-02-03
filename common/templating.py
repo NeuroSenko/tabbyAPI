@@ -18,6 +18,11 @@ from packaging import version
 from common.utils import unwrap
 
 
+def _tojson(value, ensure_ascii=True, indent=None):
+    """Custom tojson filter that supports ensure_ascii parameter."""
+    return json.dumps(value, ensure_ascii=ensure_ascii, indent=indent)
+
+
 class TemplateLoadError(Exception):
     """Raised on prompt template load"""
 
@@ -32,18 +37,24 @@ class TemplateMetadata:
     tool_start: Optional[str] = None
 
 
+def _create_jinja_env():
+    env = ImmutableSandboxedEnvironment(
+        trim_blocks=True,
+        lstrip_blocks=True,
+        enable_async=True,
+        extensions=[loopcontrols],
+    )
+    env.filters["tojson"] = _tojson
+    return env
+
+
 class PromptTemplate:
     """A template for chat completion prompts."""
 
     name: str
     raw_template: str
     template: Template
-    environment: ImmutableSandboxedEnvironment = ImmutableSandboxedEnvironment(
-        trim_blocks=True,
-        lstrip_blocks=True,
-        enable_async=True,
-        extensions=[loopcontrols],
-    )
+    environment: ImmutableSandboxedEnvironment = _create_jinja_env()
     metadata: Optional[TemplateMetadata] = None
 
     async def extract_metadata(self, template_vars: dict):
