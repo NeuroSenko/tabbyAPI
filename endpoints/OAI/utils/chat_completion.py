@@ -83,12 +83,13 @@ def _create_response(
         # If no tool_calls in metadata, try to extract from content
         if not tool_calls and content:
             import re
-            # Check if content contains <tool_call> tags
-            if '<tool_call>' in content:
+            # Check if content contains tool call tags
+            tool_call_tag_pattern = r'<(?:minimax:)?tool_call>.*?</(?:minimax:)?tool_call>'
+            if '<tool_call>' in content or '<minimax:tool_call>' in content:
                 tool_calls = content
                 # Remove tool call from visible content
                 message.content = re.sub(
-                    r'<tool_call>.*?</tool_call>', '', content, flags=re.DOTALL
+                    tool_call_tag_pattern, '', content, flags=re.DOTALL
                 ).strip()
 
         if tool_calls and tool_calls.strip():
@@ -220,8 +221,9 @@ def _create_stream_chunk(
 
         # Remove any tool call fragments that might leak through
         import re
-        if '</tool_call>' in text_content and '<tool_call>' not in text_content:
-            text_content = text_content.replace('</tool_call>', '').strip()
+        if ('</tool_call>' in text_content and '<tool_call>' not in text_content) or \
+           ('</minimax:tool_call>' in text_content and '<minimax:tool_call>' not in text_content):
+            text_content = text_content.replace('</tool_call>', '').replace('</minimax:tool_call>', '').strip()
 
         message = ChatCompletionMessage(
             role="assistant", content=text_content
@@ -369,7 +371,7 @@ async def apply_chat_template(data: ChatCompletionRequest):
         # but not the generated output. We capture it here so it can be
         # prepended to the response, giving clients the full <think>...</think>.
         generation_prefix = ""
-        if data.add_generation_prompt and prompt.endswith("<think>"):
+        if data.add_generation_prompt and prompt.rstrip("\n").endswith("<think>"):
             generation_prefix = "<think>"
 
         # Removes the starting BOS token if the model adds one
@@ -480,8 +482,8 @@ async def stream_generate_chat_completion(
                 raise generation
 
             # Check if we're inside a tool call block and should suppress output
-            if '<tool_call>' in current_generation_text:
-                if '</tool_call>' not in current_generation_text:
+            if '<tool_call>' in current_generation_text or '<minimax:tool_call>' in current_generation_text:
+                if '</tool_call>' not in current_generation_text and '</minimax:tool_call>' not in current_generation_text:
                     tool_call_started = True
                 else:
                     tool_call_started = False
@@ -567,17 +569,18 @@ async def stream_generate_chat_completion(
             # Check if all tasks are completed
             if all(task.done() for task in gen_tasks) and gen_queue.empty():
                 # Check for tool calls in accumulated text
-                if current_generation_text and '<tool_call>' in current_generation_text:
+                tool_call_tag_pattern = r'<(?:minimax:)?tool_call>.*?</(?:minimax:)?tool_call>'
+                if current_generation_text and ('<tool_call>' in current_generation_text or '<minimax:tool_call>' in current_generation_text):
                     import re
                     # Extract tool calls from the accumulated text
-                    tool_call_match = re.search(r'<tool_call>.*?</tool_call>', current_generation_text, re.DOTALL)
+                    tool_call_match = re.search(tool_call_tag_pattern, current_generation_text, re.DOTALL)
                     if tool_call_match:
                         logger.info(f"Extracted tool call from stream: {tool_call_match.group(0)[:100]}")
                         generation["tool_calls"] = tool_call_match.group(0)
                         generation["finish_reason"] = "tool_calls"
 
                         # Remove the tool call from the full text to get clean content
-                        clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', current_generation_text, flags=re.DOTALL).strip()
+                        clean_text = re.sub(tool_call_tag_pattern, '', current_generation_text, flags=re.DOTALL).strip()
                         generation["text"] = clean_text
 
                         # Send final chunk with tool calls
@@ -684,8 +687,8 @@ async def generate_tool_calls(
     # Copy to make sure the parent JSON schema doesn't get modified
     tool_data = data.model_copy(deep=True)
 
-    # Use Qwen schema if tool_start is <tool_call>, otherwise use standard schema
-    if tool_start == "<tool_call>":
+    # Use Qwen schema for known single-object formats, standard schema otherwise
+    if tool_start in ("<tool_call>", "<minimax:tool_call>"):
         tool_data.json_schema = TOOL_CALL_SCHEMA_QWEN
         logger.info(f"Using Qwen tool call schema: {TOOL_CALL_SCHEMA_QWEN}")
     else:
@@ -698,11 +701,14 @@ async def generate_tool_calls(
 
         logger.info(f"Detected tool call in chat completion request {request.state.id}")
 
-        # Append the existing generation text if present
+        # Append the existing generation text and tool_start token
         precursor_text = gen.get("full_text")
         if precursor_text:
             prompt = prompt + precursor_text
             logger.debug(f"Tool call precursor text: {precursor_text}")
+
+        # Add the tool_start token back so the model knows it's in tool-calling mode
+        prompt = prompt + tool_start
 
         gen_request_id = gen.get("request_id")
         tool_request_id = f"{gen_request_id}-tool"

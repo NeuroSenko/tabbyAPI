@@ -86,6 +86,9 @@ class PromptTemplate:
         if hasattr(template_module, "tool_start"):
             if isinstance(template_module.tool_start, str):
                 template_metadata.tool_start = template_module.tool_start
+        elif hasattr(template_module, "toolcall_begin_token"):
+            if isinstance(template_module.toolcall_begin_token, str):
+                template_metadata.tool_start = template_module.toolcall_begin_token
 
         self.metadata = template_metadata
         return template_metadata
