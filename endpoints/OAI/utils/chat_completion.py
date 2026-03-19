@@ -495,6 +495,10 @@ async def stream_generate_chat_completion(
 
             generation = await gen_queue.get()
 
+            # Stream collector will push an exception to the queue if it fails
+            if isinstance(generation, Exception):
+                raise generation
+
             # Handle options if a tool model is present
             if tool_start:
                 if "stop_str" in generation:
@@ -514,10 +518,6 @@ async def stream_generate_chat_completion(
                 # Accumulate text even without tool_start
                 if "text" in generation:
                     current_generation_text += generation["text"]
-
-            # Stream collector will push an exception to the queue if it fails
-            if isinstance(generation, Exception):
-                raise generation
 
             # Check if we're inside a tool call block and should suppress output
             if '<tool_call>' in current_generation_text or '<minimax:tool_call>' in current_generation_text:
