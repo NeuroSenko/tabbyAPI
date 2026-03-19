@@ -17,6 +17,7 @@ from common.networking import (
     handle_request_error,
     request_disconnect_loop,
 )
+from common.tabby_config import config
 from common.utils import unwrap
 from endpoints.OAI.types.chat_completion import (
     ChatCompletionLogprobs,
@@ -61,6 +62,27 @@ def _split_thinking(text: str) -> tuple:
     return None, text
 
 
+def _extract_think_content(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Extract content between <think> tags and the remaining content.
+    Only available in none-streaming mode."""
+    if (
+        model.container.reasoning_start_token not in text
+        and model.container.reasoning_end_token not in text
+    ):
+        return None, text
+    elif model.container.reasoning_start_token in text:
+        start_reasoning = text.split(model.container.reasoning_start_token)[1]
+        reasoning_content = start_reasoning.split(model.container.reasoning_end_token)[
+            0
+        ]
+        content = start_reasoning.split(model.container.reasoning_end_token)[1]
+        return reasoning_content.strip(), content.strip()
+    else:
+        reasoning_content = text.split(model.container.reasoning_end_token)[0]
+        content = text.split(model.container.reasoning_end_token)[1]
+        return reasoning_content.strip(), content.strip()
+
+
 def _create_response(
     request_id: str,
     generations: List[dict],
@@ -71,11 +93,18 @@ def _create_response(
 
     choices = []
     for index, generation in enumerate(generations):
-        raw_text = generation_prefix + unwrap(generation.get("text"), "")
-        reasoning_content, content = _split_thinking(raw_text)
-        message = ChatCompletionMessage(
-            role="assistant", content=content, reasoning_content=reasoning_content
-        )
+        if model.container.reasoning:
+            raw_content = unwrap(generation.get("text"), "")
+            reasoning_content, content = _extract_think_content(raw_content)
+            message = ChatCompletionMessage(
+                role="assistant", reasoning_content=reasoning_content, content=content
+            )
+        else:
+            raw_text = generation_prefix + unwrap(generation.get("text"), "")
+            reasoning_content, content = _split_thinking(raw_text)
+            message = ChatCompletionMessage(
+                role="assistant", content=content, reasoning_content=reasoning_content
+            )
 
         # Check for tool calls in generation metadata
         tool_calls = generation.get("tool_calls")
@@ -171,6 +200,7 @@ def _create_stream_chunk(
     generation: Optional[dict] = None,
     model_name: Optional[str] = None,
     is_usage_chunk: bool = False,
+    is_reasoning_chunk: bool = False,
 ):
     """Create a chat completion stream chunk from the provided text."""
 
@@ -225,8 +255,14 @@ def _create_stream_chunk(
            ('</minimax:tool_call>' in text_content and '<minimax:tool_call>' not in text_content):
             text_content = text_content.replace('</tool_call>', '').replace('</minimax:tool_call>', '').strip()
 
-        message = ChatCompletionMessage(
-            role="assistant", content=text_content
+        message = (
+            ChatCompletionMessage(
+                role="assistant", reasoning_content=text_content
+            )
+            if is_reasoning_chunk
+            else ChatCompletionMessage(
+                role="assistant", content=text_content
+            )
         )
 
         logprob_response = None
@@ -450,6 +486,8 @@ async def stream_generate_chat_completion(
         current_generation_text = ""
         tool_call_started = False
 
+        is_reasoning_chunk = model.container.reasoning
+
         # Consumer loop
         while True:
             if disconnect_task.done():
@@ -493,12 +531,30 @@ async def stream_generate_chat_completion(
             should_stream = True
             if tool_call_started and "text" in generation:
                 should_stream = False
-            elif "finish_reason" in generation and not "text" in generation:
+            elif "finish_reason" in generation and "text" not in generation:
                 should_stream = True
 
             if should_stream:
-                # Handle thinking mode: route to reasoning_content vs content
-                if thinking_mode and "text" in generation:
+                # Token-based reasoning (upstream): model signals reasoning via special tokens
+                if model.container.reasoning:
+                    text = unwrap(generation.get("text"), "")
+                    if model.container.reasoning_start_token in text:
+                        is_reasoning_chunk = True
+                        continue
+                    if model.container.reasoning_end_token in text:
+                        is_reasoning_chunk = False
+                        continue
+
+                    response = _create_stream_chunk(
+                        request.state.id,
+                        generation,
+                        model_path.name,
+                        is_reasoning_chunk=is_reasoning_chunk,
+                    )
+                    yield response.model_dump_json()
+
+                # Fallback thinking mode: buffer <think>...</think> tags
+                elif thinking_mode and "text" in generation:
                     think_buffer += generation.get("text", "")
                     gen_index = generation.get("index", 0)
 
@@ -547,7 +603,6 @@ async def stream_generate_chat_completion(
                             yield resp.model_dump_json()
                 else:
                     # Flush any remaining think_buffer as reasoning
-                    # (model ended without </think>)
                     if think_buffer:
                         resp = _create_stream_chunk(
                             request.state.id,
