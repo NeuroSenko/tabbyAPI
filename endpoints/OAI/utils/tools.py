@@ -88,6 +88,9 @@ class ToolCallProcessor:
 
         tool_calls = []
 
+        # Strip MiniMax wrapper tags if present
+        tool_calls_str = re.sub(r'</?minimax:tool_call>', '', tool_calls_str).strip()
+
         # First, try the <tool_call> format with embedded JSON
         tool_call_pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
         tool_call_matches = re.findall(tool_call_pattern, tool_calls_str, re.DOTALL)

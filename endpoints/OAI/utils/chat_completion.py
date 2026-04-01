@@ -773,13 +773,22 @@ async def generate_tool_calls(
     # Copy to make sure the parent JSON schema doesn't get modified
     tool_data = data.model_copy(deep=True)
 
-    # Use Qwen schema for known single-object formats, standard schema otherwise
-    if tool_start in ("<tool_call>", "<minimax:tool_call>"):
+    # MiniMax uses native XML <invoke> format — don't constrain with JSON schema,
+    # let the model generate XML naturally and stop at the end tag
+    if tool_start == "<minimax:tool_call>":
+        tool_data.json_schema = None
+        if not tool_data.stop:
+            tool_data.stop = []
+        elif isinstance(tool_data.stop, str):
+            tool_data.stop = [tool_data.stop]
+        tool_data.stop.append("</minimax:tool_call>")
+        logger.info("Using native XML tool call format (MiniMax)")
+    elif tool_start == "<tool_call>":
         tool_data.json_schema = TOOL_CALL_SCHEMA_QWEN
         logger.info(f"Using Qwen tool call schema: {TOOL_CALL_SCHEMA_QWEN}")
     else:
         tool_data.json_schema = TOOL_CALL_SCHEMA
-        logger.info(f"Using standard tool call schema")
+        logger.info("Using standard tool call schema")
 
     for idx, gen in enumerate(generations):
         if gen["stop_str"] != tool_start:
