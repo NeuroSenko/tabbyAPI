@@ -97,6 +97,7 @@ class ExllamaV3Container(BaseModelContainer):
 
         Args:
             model_directory: Path to the model files.
+            hf_model: HF config.json wrapper.
             **kwargs: Backend-specific configuration options.
 
         Returns:
@@ -115,17 +116,23 @@ class ExllamaV3Container(BaseModelContainer):
         self.tokenizer = Tokenizer.from_config(self.config)
 
         # Prepare vision model if requested in config
-        self.use_vision = kwargs.get("vision")
-        if self.use_vision and "vision" in self.config.model_classes:
-            self.vision_model = Model.from_config(self.config, component="vision")
+        self.vision_model = None
+        self.use_vision = kwargs.get("vision", False)
+        if self.use_vision:
+            if "vision" in self.config.model_classes:
+                self.vision_model = Model.from_config(self.config, component="vision")
+            else:
+                logger.warning(
+                    "The provided model does not have vision capabilities that are "
+                    "supported by ExllamaV3. Vision input is disabled."
+                )
+                self.use_vision = False
         else:
-            logger.warning(
-                "The provided model does not have vision capabilities that are "
-                "supported by ExllamaV3. "
-                "Vision input is disabled."
-            )
-            self.vision_model = None
-            self.use_vision = False
+            if "vision" in self.config.model_classes:
+                logger.info(
+                    "The provided model has vision capabilities, vision is disabled "
+                    "in config."
+                )
 
         # Prepare the draft model config if necessary
         draft_args = unwrap(kwargs.get("draft_model"), {})
@@ -245,18 +252,19 @@ class ExllamaV3Container(BaseModelContainer):
             max_seq_len = max_seq_len_default
 
         cache_size_user = kwargs.get("cache_size")
-        cache_size_default = 8192
+        cache_size_default = max_seq_len
 
         if cache_size_user:
             logger.info(f"Using configured cache_size: {cache_size_user} tokens.")
             cache_size = cache_size_user
         else:
             logger.warning(
-                f"cache_size is undefined. Defaulting to {cache_size_default} tokens."
+                f"cache_size is undefined. Defaulting to {cache_size_default} tokens. "
+                f"You should ideally configure cache_size explicitly."
             )
             cache_size = cache_size_default
 
-        if max_seq_len < cache_size:
+        if max_seq_len > cache_size:
             logger.warning(
                 f"The given max_seq_len ({max_seq_len}) is larger than the cache size "
                 f"and will be limited to {cache_size} tokens."
@@ -307,9 +315,9 @@ class ExllamaV3Container(BaseModelContainer):
             )
 
         # Reasoning mode
-        self.reasoning = kwargs.get("reasoning")
-        self.reasoning_start_token = kwargs.get("reasoning_start_token")
-        self.reasoning_end_token = kwargs.get("reasoning_end_token")
+        self.reasoning = kwargs.get("reasoning", False)
+        self.reasoning_start_token = kwargs.get("reasoning_start_token", "<think>")
+        self.reasoning_end_token = kwargs.get("reasoning_end_token", "</think>")
 
         return self
 
@@ -919,7 +927,9 @@ class ExllamaV3Container(BaseModelContainer):
             params.frequency_penalty,
             params.presence_penalty,
             penalty_range,
-            repetition_decay,
+            max(
+                repetition_decay, 1
+            ),  # TODO: Allow decay = 0 when exl3 kernel fix is pushed (v0.0.27)
         )
 
         # Apply temperature first to builder

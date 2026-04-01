@@ -8,6 +8,7 @@ from typing import List, Optional
 from fastapi import HTTPException, Request
 from jinja2 import TemplateError
 from loguru import logger
+import re
 
 from common import model
 from common.multimodal import MultimodalEmbeddingWrapper
@@ -17,7 +18,6 @@ from common.networking import (
     handle_request_error,
     request_disconnect_loop,
 )
-from common.tabby_config import config
 from common.utils import unwrap
 from endpoints.OAI.types.chat_completion import (
     ChatCompletionLogprobs,
@@ -81,6 +81,34 @@ def _extract_think_content(text: str) -> tuple[Optional[str], Optional[str]]:
         reasoning_content = text.split(model.container.reasoning_end_token)[0]
         content = text.split(model.container.reasoning_end_token)[1]
         return reasoning_content.strip(), content.strip()
+
+
+def _start_in_reasoning_mode(prompt: str) -> bool:
+    """Determine if the formatted prompt indicates that inference should start in
+    reasoning mode.
+    - the system prompt may contain instructions mentioning both tags
+    - templates that force-disable thinking may force <think> </think> in the response
+    - templates that force-enable thinking may force just <think>
+    Best guess: check if the last occurrence of either is <think>, and not much text
+    and no other <> tags follow it."""
+    _think_prefix_max_chars = 256  # Arbitrary hard-cutoff threshold
+    _tags_max_length = 32
+
+    st = model.container.reasoning_start_token
+    et = model.container.reasoning_end_token
+    last_st = prompt.rfind(st)  # or -1
+    last_et = prompt.rfind(et)  # or -1
+    if last_st <= last_et:
+        return False
+    i = last_st + len(st)
+    if len(prompt) - i > _think_prefix_max_chars:
+        return False
+    char_op = st[:1]
+    char_cl = st[-1:]
+    tags_pattern = char_op + r"\S{1," + str(_tags_max_length - 2) + r"}" + char_cl
+    if re.search(tags_pattern, prompt[i:]):
+        return False
+    return True
 
 
 def _create_response(
@@ -486,7 +514,10 @@ async def stream_generate_chat_completion(
         current_generation_text = ""
         tool_call_started = False
 
-        is_reasoning_chunk = model.container.reasoning
+        # Determine if we're streaming content or reasoning_content to start with
+        is_reasoning_chunk = model.container.reasoning and _start_in_reasoning_mode(
+            prompt
+        )
 
         # Consumer loop
         while True:

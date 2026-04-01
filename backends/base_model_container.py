@@ -39,6 +39,10 @@ class BaseModelContainer(abc.ABC):
     load_lock: asyncio.Lock
     load_condition: asyncio.Condition
 
+    reasoning: bool
+    reasoning_start_token: Optional[str]
+    reasoning_end_token: Optional[str]
+
     # Required methods
     @classmethod
     @abc.abstractmethod
@@ -48,6 +52,7 @@ class BaseModelContainer(abc.ABC):
 
         Args:
             model_directory: Path to the model files.
+            hf_model: HF config.json wrapper.
             **kwargs: Backend-specific configuration options.
 
         Returns:
