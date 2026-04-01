@@ -90,6 +90,18 @@ class PromptTemplate:
             if isinstance(template_module.toolcall_begin_token, str):
                 template_metadata.tool_start = template_module.toolcall_begin_token
 
+        # Auto-detect tool_start from template content if not explicitly set
+        if not template_metadata.tool_start:
+            if "<minimax:tool_call>" in self.raw_template:
+                template_metadata.tool_start = "<minimax:tool_call>"
+            elif "<tool_call>" in self.raw_template:
+                template_metadata.tool_start = "<tool_call>"
+
+            if template_metadata.tool_start:
+                logger.info(
+                    f"Auto-detected tool_start: {template_metadata.tool_start}"
+                )
+
         self.metadata = template_metadata
         return template_metadata
 

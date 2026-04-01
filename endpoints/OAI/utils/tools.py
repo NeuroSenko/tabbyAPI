@@ -29,45 +29,61 @@ TOOL_CALL_SCHEMA = {
     },
 }
 
-# Qwen-style schema: {"name": "...", "arguments": {...}}
+# Qwen-style schema (array): [{"name": "...", "arguments": {...}}, ...]
 TOOL_CALL_SCHEMA_QWEN = {
     "$schema": "http://json-schema.org/draft-07/schema#",
-    "type": "object",
-    "properties": {
-        "name": {"type": "string"},
-        "arguments": {"type": "object"},
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "arguments": {"type": "object"},
+        },
+        "required": ["name", "arguments"],
     },
-    "required": ["name", "arguments"],
 }
 
 
 class ToolCallProcessor:
     @staticmethod
+    def _qwen_item_to_tool_call(item: dict) -> ToolCall:
+        """Convert a Qwen-format dict {"name": ..., "arguments": ...} to ToolCall."""
+        return ToolCall(
+            **{
+                "function": {
+                    "name": item["name"],
+                    "arguments": json.dumps(item["arguments"])
+                    if isinstance(item["arguments"], dict)
+                    else item["arguments"],
+                }
+            }
+        )
+
+    @staticmethod
     def from_json(tool_calls_str: str) -> List[ToolCall]:
         """Postprocess tool call JSON to a parseable class
 
-        Supports two formats:
+        Supports three formats:
         1. Array format: [{"function": {"name": "...", "arguments": {...}}}]
-        2. Qwen format: {"name": "...", "arguments": {...}}
+        2. Qwen format (single): {"name": "...", "arguments": {...}}
+        3. Qwen format (array): [{"name": "...", "arguments": {...}}, ...]
         """
 
         parsed = json.loads(tool_calls_str)
 
-        # Check if it's Qwen format (single object with "name" and "arguments")
+        # Single Qwen-format object
         if isinstance(parsed, dict) and "name" in parsed and "arguments" in parsed:
-            # Convert Qwen format to standard format
-            tool_call_dict = {
-                "function": {
-                    "name": parsed["name"],
-                    "arguments": json.dumps(parsed["arguments"])
-                    if isinstance(parsed["arguments"], dict)
-                    else parsed["arguments"],
-                }
-            }
-            return [ToolCall(**tool_call_dict)]
+            return [ToolCallProcessor._qwen_item_to_tool_call(parsed)]
 
-        # Standard array format
+        # Array format — detect Qwen vs standard by first element
         tool_calls = parsed if isinstance(parsed, list) else [parsed]
+        if tool_calls and "name" in tool_calls[0] and "arguments" in tool_calls[0]:
+            # Qwen array format
+            return [
+                ToolCallProcessor._qwen_item_to_tool_call(tc) for tc in tool_calls
+            ]
+
+        # Standard OAI array format: [{"function": {"name": ..., "arguments": ...}}]
         for tool_call in tool_calls:
             tool_call["function"]["arguments"] = json.dumps(
                 tool_call["function"]["arguments"]
