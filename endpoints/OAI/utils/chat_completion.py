@@ -384,6 +384,12 @@ async def _chat_stream_collector(
     splits = [re.escape(s) for s in [t_tool_start, t_tool_end, t_think_start, t_think_end] if s]
     split_re = re.compile("|".join(splits)) if splits else None
 
+    # A tag can span several tokens (e.g. DeepSeek-V4's <｜DSML｜tool_calls> is 6 tokens) and therefore
+    # arrive across separate stream deltas. Hold back any trailing text that is a prefix of some tag
+    # so the tag is reassembled and matched on a later delta instead of leaking into content.
+    all_tags = [s for s in [t_tool_start, t_tool_end, t_think_start, t_think_end] if s]
+    held_tag = ""
+
     # Collect logprobs
     collected_logprobs = []
 
@@ -399,7 +405,8 @@ async def _chat_stream_collector(
         generation = {}
         async for generation in new_generation:
             generation["index"] = task_idx
-            text = generation.get("text", "")
+            text = held_tag + generation.get("text", "")
+            held_tag = ""
             finish_reason = generation.get("finish_reason")
             delta_reasoning = ""
             delta_content = ""
@@ -414,7 +421,18 @@ async def _chat_stream_collector(
                         i, j = match.span()
                         sub, text, tag = text[:i], text[j:], match[0]
                     else:
-                        sub, text, tag = text, "", None
+                        # No complete tag. If a trailing slice of the text is a prefix of some tag,
+                        # hold it for the next delta so a multi-token tag can be reassembled (unless
+                        # this is the final delta, where nothing more is coming).
+                        hold = ""
+                        if not finish_reason:
+                            for _t in all_tags:
+                                for k in range(min(len(text), len(_t) - 1), len(hold), -1):
+                                    if text[-k:] == _t[:k]:
+                                        hold = text[-k:]
+                                        break
+                        held_tag = hold
+                        sub, text, tag = text[: len(text) - len(hold)], "", None
                 else:
                     sub, text, tag = text, "", None
 

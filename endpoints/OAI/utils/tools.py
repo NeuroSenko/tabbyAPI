@@ -11,9 +11,11 @@ from endpoints.OAI.utils.toolcall_formats import (
     mistral_old,
     mistral,
     gemma4,
+    deepseek_v4,
 )
 
 ALL_TOOLCALL_FORMATS = {
+    "deepseek_v4": deepseek_v4,
     "gemma4": gemma4,
     "glm4_5": glm4_5,
     "glm4_6": glm4_5,

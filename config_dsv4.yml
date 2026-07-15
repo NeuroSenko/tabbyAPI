@@ -1,0 +1,28 @@
+network:
+  host: rig-lan.home
+  port: 5000
+  disable_auth: true
+  api_servers: ["OAI"]
+logging:
+  log_requests: true
+model:
+  model_dir: /home/user1/data/llm-my-quants
+  model_name: DeepSeek-V4-Flash-exl3-4.0bpw
+  backend: exllamav3
+  max_seq_len: 262144
+  cache_size: 262400
+  cache_mode: FP16
+  gpu_split_auto: true
+  # 3 GB reserved on EVERY GPU. A single-element list reserves only on GPU0, packing the rest full of
+  # weights so the autosplit's per-layer dummy forward (cache alloc + indexer transient) OOMs; the
+  # model needs ~3 GB/GPU of headroom to load the 256k compressed cache and run.
+  autosplit_reserve: [3072, 3072, 3072, 3072, 3072, 3072]
+  chunk_size: 2048
+  max_batch_size: 1
+  # Parse the model's DSML tool-call output (<｜DSML｜tool_calls>...) into OpenAI tool_calls.
+  # Requires the chat template to render the `tools` schemas (the GGUF/authoritative template does).
+  tool_format: deepseek_v4
+developer:
+  disable_request_streaming: false
+memory:
+  cuda_malloc_async: false
