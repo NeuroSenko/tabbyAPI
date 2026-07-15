@@ -1,5 +1,6 @@
 import re
 import json
+import html
 from common.logger import xlogger
 from endpoints.OAI.types.tools import ToolCall, Tool
 from endpoints.OAI.utils.toolcall_formats.common import coerce_param_value
@@ -40,6 +41,10 @@ _PARAM = re.compile(
 
 
 def parse_toolcalls(text: str) -> list[ToolCall]:
+    # The model sometimes HTML-escapes its tool-call tags (e.g. &lt;｜DSML｜tool_calls&gt; and &#34;
+    # for quotes) for some tools. Unescape so the same regexes handle raw and escaped output.
+    if "&lt;" + _D in text or "&amp;" in text:
+        text = html.unescape(text)
     results = []
     for im in _INVOKE.finditer(text):
         func_name = im.group(1).strip()

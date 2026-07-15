@@ -10,6 +10,7 @@ from jinja2 import TemplateError
 from common.errors import ContextLengthExceededError, ContextLengthHTTPException
 from common.logger import xlogger
 import re
+import html
 
 from common import model
 from common.multimodal import MultimodalEmbeddingWrapper
@@ -374,6 +375,18 @@ async def _chat_stream_collector(
     t_tool_start = t_tool_start if use_tool else None
     t_tool_end = t_tool_end if use_tool else None
 
+    # Some models HTML-escape their tool-call tags for certain tools (e.g. DeepSeek-V4 emits
+    # &lt;｜DSML｜tool_calls&gt; instead of <｜DSML｜tool_calls>); recognize the escaped form too. The
+    # tool-format parser HTML-unescapes the captured block before parsing.
+    t_tool_start_esc = html.escape(t_tool_start, quote=False) if t_tool_start else None
+    t_tool_end_esc = html.escape(t_tool_end, quote=False) if t_tool_end else None
+    if t_tool_start_esc == t_tool_start:
+        t_tool_start_esc = None
+    if t_tool_end_esc == t_tool_end:
+        t_tool_end_esc = None
+    tool_start_tags = {t for t in [t_tool_start, t_tool_start_esc] if t}
+    tool_end_tags = {t for t in [t_tool_end, t_tool_end_esc] if t}
+
     use_think = mc.reasoning and bool(mc.reasoning_start_token)
     t_think_start = mc.reasoning_start_token if use_think else None
     t_think_end = mc.reasoning_end_token if use_think else None
@@ -381,13 +394,21 @@ async def _chat_stream_collector(
     t_suppress = t_suppress_header
 
     # Regex to identify tool/think tags that may or may not arrive with other text
-    splits = [re.escape(s) for s in [t_tool_start, t_tool_end, t_think_start, t_think_end] if s]
+    splits = [
+        re.escape(s)
+        for s in [t_tool_start, t_tool_start_esc, t_tool_end, t_tool_end_esc, t_think_start, t_think_end]
+        if s
+    ]
     split_re = re.compile("|".join(splits)) if splits else None
 
     # A tag can span several tokens (e.g. DeepSeek-V4's <｜DSML｜tool_calls> is 6 tokens) and therefore
     # arrive across separate stream deltas. Hold back any trailing text that is a prefix of some tag
     # so the tag is reassembled and matched on a later delta instead of leaking into content.
-    all_tags = [s for s in [t_tool_start, t_tool_end, t_think_start, t_think_end] if s]
+    all_tags = [
+        s
+        for s in [t_tool_start, t_tool_start_esc, t_tool_end, t_tool_end_esc, t_think_start, t_think_end]
+        if s
+    ]
     held_tag = ""
 
     # Collect logprobs
@@ -465,7 +486,7 @@ async def _chat_stream_collector(
                 # Track output phase. No nesting is expected, except tools may occur in
                 # reasoning content
                 if tag:
-                    if tag == t_tool_end:  # include outer tool tags in output
+                    if tag in tool_end_tags:  # include outer tool tags in output
                         delta_tool += tag
                         full_tool += tag
                     if not in_tool:
@@ -476,18 +497,19 @@ async def _chat_stream_collector(
                         elif tag == t_think_end:
                             post_reasoning_whitespace = True
                             in_reasoning = False
-                    if tag == t_tool_start:
+                    if tag in tool_start_tags:
                         in_tool = True
                         delta_tool += tag  # include outer tool tags in output
                         full_tool += tag
-                    elif tag == t_tool_end:
+                    elif tag in tool_end_tags:
                         in_tool = False
 
             # Collect logprobs in content span only. Also make sure we're not just coming
             # out of a </think> tag
             if (
                 "logprobs_content" in generation
-                and tag not in [t_think_end, t_tool_end]
+                and tag != t_think_end
+                and tag not in tool_end_tags
                 and not in_reasoning
                 and not in_tool
             ):
