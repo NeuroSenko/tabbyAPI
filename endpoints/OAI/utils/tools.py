@@ -5,6 +5,7 @@ from typing import List
 
 from endpoints.OAI.types.tools import ToolCall
 from endpoints.OAI.utils.toolcall_formats import (
+    deepseek_v4,
     qwen3_coder,
     minimax_m2,
     glm4_5,
@@ -15,6 +16,7 @@ from endpoints.OAI.utils.toolcall_formats import (
 )
 
 ALL_TOOLCALL_FORMATS = {
+    "deepseek_v4": deepseek_v4,
     "gemma4": gemma4,
     "glm4_5": glm4_5,
     "glm4_6": glm4_5,

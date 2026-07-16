@@ -1,0 +1,24 @@
+network:
+  host: 127.0.0.1
+  port: 5000
+  disable_auth: true
+  api_servers: ["OAI"]
+logging:
+  log_requests: true
+model:
+  model_dir: models
+  model_name: DeepSeek-V4-Flash-exl3-4.0bpw
+  backend: exllamav3
+  max_seq_len: 262144
+  cache_size: 262400
+  cache_mode: FP16
+  gpu_split_auto: true
+  chunk_size: 2048
+  max_batch_size: 1
+  # Parse the model's DSML tool-call output (<｜DSML｜tool_calls>...) into OpenAI tool_calls.
+  # Requires the chat template to render the `tools` schemas (the GGUF/authoritative template does).
+  tool_format: deepseek_v4
+developer:
+  disable_request_streaming: false
+memory:
+  cuda_malloc_async: false
