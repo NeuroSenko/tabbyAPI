@@ -1,5 +1,6 @@
 """Incremental splitting of generated text into reasoning/content/tool channels."""
 
+import html
 import re
 from typing import List, Optional, Tuple
 
@@ -37,6 +38,20 @@ class TagStreamParser:
         self.tool_end = tool_end
         self.tool_calls_in_reasoning = tool_calls_in_reasoning
 
+        # Some models HTML-escape their tool-call tags for certain tools (e.g. DeepSeek-V4
+        # emits &lt;｜DSML｜tool_calls&gt; instead of <｜DSML｜tool_calls>); recognize the
+        # escaped form too so the tag is still routed to the tool channel. The tool-format
+        # parser HTML-unescapes the captured block before parsing, so emitting the escaped
+        # tag verbatim is fine.
+        tool_start_esc = html.escape(tool_start, quote=False) if tool_start else None
+        tool_end_esc = html.escape(tool_end, quote=False) if tool_end else None
+        if tool_start_esc == tool_start:
+            tool_start_esc = None
+        if tool_end_esc == tool_end:
+            tool_end_esc = None
+        self._tool_start_tags = {t for t in (tool_start, tool_start_esc) if t}
+        self._tool_end_tags = {t for t in (tool_end, tool_end_esc) if t}
+
         self.in_reasoning = start_in_reasoning
         self.in_tool = False
 
@@ -51,7 +66,18 @@ class TagStreamParser:
         self._held_ws = ""
 
         # Longer tags win when two tags match at the same position
-        tags = [t for t in (tool_start, tool_end, reasoning_start, reasoning_end) if t]
+        tags = [
+            t
+            for t in (
+                tool_start,
+                tool_start_esc,
+                tool_end,
+                tool_end_esc,
+                reasoning_start,
+                reasoning_end,
+            )
+            if t
+        ]
         tags.sort(key=len, reverse=True)
         self._tags = tags
         self._tag_re = re.compile("|".join(re.escape(t) for t in tags)) if tags else None
@@ -145,15 +171,15 @@ class TagStreamParser:
                 return
 
         if self.in_reasoning and not self.in_tool and not self.tool_calls_in_reasoning:
-            if tag in (self.tool_start, self.tool_end):
+            if tag in self._tool_start_tags or tag in self._tool_end_tags:
                 # Treat tool tags inside reasoning as plain reasoning text
                 events.append((REASONING, tag))
                 return
 
-        if tag == self.tool_start:
+        if tag in self._tool_start_tags:
             self.in_tool = True
             events.append((TOOL, tag))
-        elif tag == self.tool_end:
+        elif tag in self._tool_end_tags:
             events.append((TOOL, tag))
             self.in_tool = False
 
