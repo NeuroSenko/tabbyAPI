@@ -231,8 +231,8 @@ class ModelConfig(BaseConfigModel):
             "Represented as an array of MB per GPU."
         ),
     )
-    gpu_split: List[float] = Field(
-        default_factory=list,
+    gpu_split: Optional[List[float]] = Field(
+        None,
         description=(
             "Array of VRAM sizes to split between GPUs, in GB (default: []).\n"
             "Used with tensor parallelism."

@@ -8,3 +8,7 @@ temperature:
 top_p:
   override: 0.9
   force: false
+
+max_tokens:
+  override: 8192
+  force: false
